@@ -1,26 +1,30 @@
 #include <stdio.h>
+#include <math.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 
 typedef struct {
-    unsigned char *pixels; 
-    int img_width;
-    int img_height;
-    int n_img;
-} Images;
+    float *entries;
+    int rank;
+    int* shape;
+} Tensor;
 
 typedef struct {
-    unsigned char *labels;
-    int n_labels;
-} Labels;
+    Tensor* image_batches;
+    Tensor* label_batches;
+} Data;
 
 typedef struct {
-    float *weights;
-    float *bias;
-    int n_rows;
-    int n_cols;
+    Tensor weights;
+    Tensor bias;
 } Projection;
+
+typedef struct {
+    Projection *projections;
+    int n_layers;
+} Layers;
 
 const int image_id = 2051;
 const int label_id = 2049;
@@ -33,7 +37,7 @@ int read_header_bytes(FILE *file){
     return (int)(b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]);
 }
 
-void read_data(Images *image_data, Labels *labels, const char *data_path){
+void read_data(Data *data, const char *data_path, int batch_size){
     //this a stream structure when you call readdir(d) it returns a pointer to the next dirent -> data coudl be all over
     //a dirent has the information for a file or directory it has fields (char d_name[], d_ino[], d_type) -> d_type says if its a file or dir d_name is the name
     DIR *d;
@@ -68,52 +72,98 @@ void read_data(Images *image_data, Labels *labels, const char *data_path){
                 int n_images = read_header_bytes(file);
                 int n_rows = read_header_bytes(file);
                 int n_cols = read_header_bytes(file);
-
+                size_t n_batches = n_images / batch_size;
                 
-                //just have all the image data in one array i can seperate it as i like
-                if(image_data->pixels == NULL){
-                    size_t n_pixels = n_images * n_rows * n_cols;
-
-                    image_data->pixels = malloc(n_pixels * sizeof(unsigned char));
-
-                    image_data->n_img = n_images;
-                    image_data->img_height = n_rows;
-                    image_data->img_width = n_cols;
-                } else {
-                    int total_imgs = n_images + image_data->n_img;
-                    size_t n_pixels = total_imgs * n_images * n_cols; 
-
-                    image_data->pixels = realloc(image_data->pixels, n_pixels * sizeof(unsigned char));
-
-                    image_data->n_img = total_imgs;
+                //goal tensor (n_batches, batch_size, n_rows, n_cols)
+                if(data->image_batches == NULL){
+                    //each tensor here is a batch
+                    data->image_batches = malloc(n_batches * sizeof(Tensor));
                 }
 
-                int counter = 0;
-                unsigned char buffer;
 
+                //there are batch_size imgs in a batch
+                int img_id = 0;
+                int batch_id = 0;
+                int entry_id = 0;
+
+                bool alloc = true;
+
+                int *shape_ptr = malloc(3*sizeof(int));
+                memcpy(shape_ptr, (int[]){batch_size, n_rows, n_cols}, 3*sizeof(int));
+
+                unsigned char buffer;
                 while(fread(&buffer, sizeof(char), 1, file) == 1){
-                    image_data->pixels[counter] = buffer; 
-                    counter++;
+                    if(img_id % batch_size == 0 && alloc){
+                        if(img_id > 0){
+                            batch_id++;
+                            entry_id = 0;
+                        }
+
+                        int n_imgs_in_batch = batch_size;
+                        if(n_images - img_id < batch_size){
+                            n_imgs_in_batch = n_images - img_id; 
+                            shape_ptr = malloc(3*sizeof(int));
+                            memcpy(shape_ptr, (int[]){n_imgs_in_batch, n_rows, n_cols}, 3*sizeof(int));
+                        }
+
+                        data->image_batches[batch_id].entries = malloc(n_imgs_in_batch * n_rows * n_cols * sizeof(float));
+                        data->image_batches[batch_id].rank = 3;
+                        data->image_batches[batch_id].shape = shape_ptr;
+                        alloc = false;
+                    } 
+
+
+                    data->image_batches[batch_id].entries[entry_id] = (float)buffer/255; 
+                    entry_id++;
+
+                    if(entry_id % (n_rows * n_cols) == 0 && entry_id != 0){
+                        img_id++;
+                        alloc = true;
+                    }
                 }
             } else if(magic_number == label_id) {
                 int n_labels = read_header_bytes(file);
                 
-                if(labels->labels == NULL){
-                    labels->labels = malloc(n_labels * sizeof(unsigned char));
-                    labels->n_labels = n_labels;
-                } else {
-                    int total_labels = n_labels + labels->n_labels;
+                //goal tensor is (n_batches, batch_size, 1)
+                if(data->label_batches== NULL){
+                    size_t n_batches = n_labels / batch_size;
+                    data->label_batches = malloc(n_batches * sizeof(Tensor));
+                } 
 
-                    labels->labels = realloc(labels->labels, total_labels * sizeof(unsigned char));
-                    labels->n_labels = total_labels;
-                }
 
-                int counter = 0;
+                int *shape_ptr = malloc(2*sizeof(int));
+                memcpy(shape_ptr, (int[]){batch_size, 1}, 2*sizeof(int));
+
+                int label_id = 0;
+                int batch_id = 0;
+                int entry_id = 0;
+
                 unsigned char buffer;
 
                 while(fread(&buffer, sizeof(char), 1, file) == 1){
-                    labels->labels[counter] = buffer;
-                    counter++;
+                    if(label_id % batch_size == 0){
+                        if(label_id > 0){
+                            entry_id = 0;
+                            batch_id++;
+                        }
+
+
+                        int n_labels_in_batch = batch_size;
+                        if(n_labels - label_id < batch_size){
+                            n_labels_in_batch = n_labels - label_id; 
+                            //old shape_ptr still referenceed in tensor i can free there
+                            shape_ptr = malloc(2*sizeof(int));
+                            memcpy(shape_ptr, (int[]){n_labels_in_batch, 1}, 2*sizeof(int));
+                        }
+
+                        data->label_batches[batch_id].entries = malloc(batch_size * 1 * sizeof(float));
+                        data->label_batches[batch_id].rank = 2;
+                        data->label_batches[batch_id].shape = shape_ptr;
+                    }
+                    
+                    data->label_batches[batch_id].entries[entry_id] = buffer;
+                    label_id++;
+                    entry_id++;
                 }
             } else {
                 printf("Unrecognised file type\n");
@@ -127,55 +177,107 @@ void read_data(Images *image_data, Labels *labels, const char *data_path){
     closedir(d);
 }
 
-void initaliseRandomProjections(Projection *projections, int seed, int n_layers){
+void initaliseRandomProjections(Layers *layers, int seed){
     srand(seed);
-    for(int l = 0; l < n_layers; l++){
-        Projection *p = &projections[l];
-        p->weights = malloc(p->n_rows * p->n_cols * sizeof(float));
-        p->bias = malloc(p->n_rows * sizeof(float));
-        for(int i = 0; i < p->n_rows; i++){
-            for(int j = 0; j < p->n_cols; j++){
-                //same as a * (N/RAND_MAX) - 1. N is in [0, RAND_MAX] so N/... is between 0 and 1 and we multiply by the scale
-                //substract 1 so we in [-1, 1]
-                float w_ij = ((float)rand()/(float)(RAND_MAX/2)) - 1.0;
-                //it fails here
-                p->weights[i * p->n_cols + j] = w_ij;   
+    for(int l = 0; l < layers->n_layers; l++){
+        Projection *p = &layers->projections[l];
+        
+        size_t n_elems_weights = 1;
+        size_t n_elems_bias = 1;
+
+        int max_rank = (p->weights.rank > p->bias.rank) ? p->weights.rank : p->bias.rank;
+
+        for(int r = 0; r < max_rank; r++){
+            if(r < p->weights.rank){
+                n_elems_weights *= p->weights.shape[r]; 
             }
-            p->bias[i] =  ((float)rand()/(float)(RAND_MAX/2)) - 1.0;
+
+            if(r < p->bias.rank){
+                n_elems_bias *= p->bias.shape[r]; 
+            }
+
+        }
+
+        p->weights.entries = malloc(n_elems_weights * sizeof(float));
+        p->bias.entries = malloc(n_elems_bias * sizeof(float));
+
+        int max_elems = (n_elems_weights > n_elems_bias) ? n_elems_weights : n_elems_bias;
+        for(int i = 0; i < max_elems; i++){
+            if(i < n_elems_bias){
+                p->bias.entries[i] = ((float)rand()/(float)(RAND_MAX/2)) - 1.0;   
+            }
+
+            if(i < n_elems_weights){
+                p->weights.entries[i] = ((float)rand()/(float)(RAND_MAX/2)) - 1.0;   
+            }
         }
     }
 }
+
+
 
 float relu(float z_i){
     return (z_i <= 0.0f) ? 0.0f : z_i;
 }
 
+//we batch the input data and save the change in weights, for after we have run the whole batch we update with the average change in weights
+//batch size as a multiple of 32 due to hardware optimisations with the gpu later (warps) -> 64
+void train(Layers *layers, int batch_size, Data data, size_t n_epochs){
+}
+
+float* forward_pass(Projection *projections, Data data, int n_layers){
+    for(int layer_i = 0; layer_i < n_layers; layer_i++){
+        Projection p_i = projections[layer_i];
+        
+    }
+}
+
 
 int main(void){
-    Images image_data = {0};
-    Labels labels = {0};
-    read_data(&image_data, &labels, "data/training/");
+    Data training_data = {0};
+
+    int batch_size = 32;
+    read_data(&training_data, "data/training/", batch_size);
+
+    /*batch_id: 40, entry_id: 22530, img_id: 1308, entry: 0.992157*/
+    /*printf("Batch 40, Entry 22530: %f\n", training_data.image_batches[40].entries[22530]);*/
 
 
-    int n_layers = 3;
     int next_dim_after_proj[3] = {1024, 512, 10};
 
-    Projection *projections = malloc(n_layers*sizeof(Projection));
+    Layers layers = {
+       .n_layers=3,
+       .projections = malloc(3*sizeof(Projection))
+    };
+
+    int prev_dim = 784; //the dimensions of n_rows * n_cols could easily return this in read_data but cba
 
     //the dimension after the next projection so index 0 is the dimension after proj 0
-    for(int i = 0; i < n_layers; i++){
-        int n_cols = (i == 0) ? image_data.img_width*image_data.img_height : projections[i - 1].n_rows;
-        int n_rows = next_dim_after_proj[i];
-        projections[i] = (Projection){
-                .weights=NULL,
-                .bias=NULL,
-                .n_cols=n_cols,
-                .n_rows=n_rows
+    for(int i = 0; i < layers.n_layers; i++){
+        int next_dim = next_dim_after_proj[i];
+
+        int* p_w_shape = malloc(2 * sizeof(int));
+        memcpy(p_w_shape, (int[]){next_dim, prev_dim}, 2 * sizeof(int));
+
+        int* p_b_shape = malloc(sizeof(int));
+        memcpy(p_b_shape, (int[]){next_dim}, sizeof(int));
+
+        layers.projections[i] = (Projection){
+                .weights=(Tensor){
+                    .entries=NULL,
+                    .shape=p_w_shape,
+                    .rank=2
+                },
+                .bias=(Tensor){
+                    .entries=NULL,
+                    .shape=p_b_shape,
+                    .rank=1
+                },
         };
     }
 
     int seed = 42; //rng seed
-    initaliseRandomProjections(projections, seed, n_layers);
+    initaliseRandomProjections(&layers, seed);
 
     //weights are initalised so now i need to forward pass 
     //input data matmul with project then activation till final layer 
