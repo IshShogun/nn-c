@@ -14,7 +14,6 @@ typedef struct {
 typedef struct {
     Tensor* image_batches;
     Tensor* label_batches;
-    int n_batches;
 } Data;
 
 typedef struct {
@@ -75,13 +74,6 @@ void read_data(Data *data, const char *data_path, int batch_size){
                 int n_cols = read_header_bytes(file);
                 size_t n_batches = n_images / batch_size;
 
-                if(n_batches != data->n_batches && data->n_batches != -1){
-                    printf("label data size does not match image data size");
-                    exit(1);
-                }
-
-                data->n_batches = n_batches;
-                
                 //goal tensor (n_batches, batch_size, n_rows, n_cols)
                 if(data->image_batches == NULL){
                     //each tensor here is a batch
@@ -97,7 +89,7 @@ void read_data(Data *data, const char *data_path, int batch_size){
                 bool alloc = true;
 
                 int *shape_ptr = malloc(3*sizeof(int));
-                memcpy(shape_ptr, (int[]){batch_size, n_rows, n_cols}, 3*sizeof(int));
+                memcpy(shape_ptr, (int[]){batch_size, n_rows * n_cols, 1}, 3*sizeof(int));
 
                 unsigned char buffer;
                 while(fread(&buffer, sizeof(char), 1, file) == 1){
@@ -111,7 +103,7 @@ void read_data(Data *data, const char *data_path, int batch_size){
                         if(n_images - img_id < batch_size){
                             n_imgs_in_batch = n_images - img_id; 
                             shape_ptr = malloc(3*sizeof(int));
-                            memcpy(shape_ptr, (int[]){n_imgs_in_batch, n_rows, n_cols}, 3*sizeof(int));
+                            memcpy(shape_ptr, (int[]){n_imgs_in_batch, n_rows * n_cols, 1}, 3*sizeof(int));
                         }
 
                         data->image_batches[batch_id].entries = malloc(n_imgs_in_batch * n_rows * n_cols * sizeof(float));
@@ -132,12 +124,6 @@ void read_data(Data *data, const char *data_path, int batch_size){
             } else if(magic_number == label_id) {
                 int n_labels = read_header_bytes(file);
                 size_t n_batches = n_labels / batch_size;
-                if(n_batches != data->n_batches && data->n_batches != -1){
-                    printf("label data size does not match image data size");
-                    exit(1);
-                }
-
-                data->n_batches = n_labels;
                 
                 //goal tensor is (n_batches, batch_size, 1)
                 if(data->label_batches== NULL){
@@ -234,35 +220,70 @@ float relu(float z_i){
     return (z_i <= 0.0f) ? 0.0f : z_i;
 }
 
+Tensor forward_pass(Layers layers, Tensor batch){
+    int batch_size = batch.shape[0];
+
+    Tensor input_tensor;
+
+    input_tensor.rank = batch.rank - 1;
+    //we allocate to it first so that its safe to allocate or it could write to a dangerous location
+    input_tensor.shape = malloc(input_tensor.rank * sizeof(int));
+
+    //.shape is an *int so no need for &
+    memcpy(input_tensor.shape, &batch.shape[1], (input_tensor.rank) * sizeof(int));
+
+    int n_elems = 1;
+    for(int i = 0; i < input_tensor.rank; i++){
+        n_elems *= input_tensor.shape[i];
+    }
+
+    input_tensor.entries = malloc(n_elems * sizeof(float));
+
+    for(int idx = 0; idx < batch_size; idx++){
+        memcpy(input_tensor.entries, &batch.entries[idx * n_elems], n_elems * sizeof(float));
+        
+        for(int layer_i = 0; layer_i < layers.n_layers; layer_i++){
+            
+        }
+    }
+
+    return input_tensor;
+}
+
 //we batch the input data and save the change in weights, for after we have run the whole batch we update with the average change in weights
 //batch size as a multiple of 32 due to hardware optimisations with the gpu later (warps) -> 64
 
-//image data is an array of 3D tensors (n_batches, batch_size, n_rows, n_cols)
+//image data is an array of 3D tensors (n_batches, batch_size, n_rows*n_cols, 1)
 //label data is an array of @D tensors (n_batches, batch_size, 1)
 void train(Layers *layers, Data data, size_t n_epochs){
+    int n_batches = data.image_batches->shape[0];
+    if(n_batches != data.label_batches->shape[0]){
+        printf("Number of batches in training and label data do not match\n");
+        exit(1);
+    }
     for(int epoch_i = 0; epoch_i < n_epochs; epoch_i++){
-        for(int batch_i = 0; batch_i < data.n_batches; batch_i++){
+        for(int batch_i = 0; batch_i < n_batches; batch_i++){
             //batch size in each 
             Tensor img_batch = data.image_batches[batch_i];
             Tensor label_batch = data.label_batches[batch_i];
-            
+
+            if(img_batch.shape[0] != label_batch.shape[0]){
+                printf("batch size of in training and label data do not match\n");
+                exit(1);
+            }
+
+            forward_pass(*layers, img_batch);
         } 
     }
 }
 
-Tensor forward_pass(Projection *projections, Data data, int n_layers){
-    for(int layer_i = 0; layer_i < n_layers; layer_i++){
-        Projection p_i = projections[layer_i];
-          
-    }
-}
+
 
 
 int main(void){
     Data training_data = {
         .image_batches=NULL,
         .label_batches=NULL,
-        .n_batches=-1
     };
 
     int batch_size = 32;
@@ -310,6 +331,7 @@ int main(void){
     int seed = 42; //rng seed
     initaliseRandomProjections(&layers, seed);
 
+    train(&layers, training_data, 1);
     //weights are initalised so now i need to forward pass 
     //input data matmul with project then activation till final layer 
     return 0;
