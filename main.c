@@ -14,6 +14,7 @@ typedef struct {
 typedef struct {
     Tensor* image_batches;
     Tensor* label_batches;
+    int n_batches;
 } Data;
 
 typedef struct {
@@ -73,6 +74,13 @@ void read_data(Data *data, const char *data_path, int batch_size){
                 int n_rows = read_header_bytes(file);
                 int n_cols = read_header_bytes(file);
                 size_t n_batches = n_images / batch_size;
+
+                if(n_batches != data->n_batches && data->n_batches != -1){
+                    printf("label data size does not match image data size");
+                    exit(1);
+                }
+
+                data->n_batches = n_batches;
                 
                 //goal tensor (n_batches, batch_size, n_rows, n_cols)
                 if(data->image_batches == NULL){
@@ -123,10 +131,16 @@ void read_data(Data *data, const char *data_path, int batch_size){
                 }
             } else if(magic_number == label_id) {
                 int n_labels = read_header_bytes(file);
+                size_t n_batches = n_labels / batch_size;
+                if(n_batches != data->n_batches && data->n_batches != -1){
+                    printf("label data size does not match image data size");
+                    exit(1);
+                }
+
+                data->n_batches = n_labels;
                 
                 //goal tensor is (n_batches, batch_size, 1)
                 if(data->label_batches== NULL){
-                    size_t n_batches = n_labels / batch_size;
                     data->label_batches = malloc(n_batches * sizeof(Tensor));
                 } 
 
@@ -222,26 +236,41 @@ float relu(float z_i){
 
 //we batch the input data and save the change in weights, for after we have run the whole batch we update with the average change in weights
 //batch size as a multiple of 32 due to hardware optimisations with the gpu later (warps) -> 64
-void train(Layers *layers, int batch_size, Data data, size_t n_epochs){
+
+//image data is an array of 3D tensors (n_batches, batch_size, n_rows, n_cols)
+//label data is an array of @D tensors (n_batches, batch_size, 1)
+void train(Layers *layers, Data data, size_t n_epochs){
+    for(int epoch_i = 0; epoch_i < n_epochs; epoch_i++){
+        for(int batch_i = 0; batch_i < data.n_batches; batch_i++){
+            //batch size in each 
+            Tensor img_batch = data.image_batches[batch_i];
+            Tensor label_batch = data.label_batches[batch_i];
+            
+        } 
+    }
 }
 
-float* forward_pass(Projection *projections, Data data, int n_layers){
+Tensor forward_pass(Projection *projections, Data data, int n_layers){
     for(int layer_i = 0; layer_i < n_layers; layer_i++){
         Projection p_i = projections[layer_i];
-        
+          
     }
 }
 
 
 int main(void){
-    Data training_data = {0};
+    Data training_data = {
+        .image_batches=NULL,
+        .label_batches=NULL,
+        .n_batches=-1
+    };
 
     int batch_size = 32;
     read_data(&training_data, "data/training/", batch_size);
 
     /*batch_id: 40, entry_id: 22530, img_id: 1308, entry: 0.992157*/
     /*printf("Batch 40, Entry 22530: %f\n", training_data.image_batches[40].entries[22530]);*/
-
+    /*printf("n_batches: %i\n", training_data.n_batches);*/
 
     int next_dim_after_proj[3] = {1024, 512, 10};
 
@@ -274,6 +303,8 @@ int main(void){
                     .rank=1
                 },
         };
+
+        prev_dim = next_dim;
     }
 
     int seed = 42; //rng seed
