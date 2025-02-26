@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,15 +18,20 @@ typedef struct {
 typedef struct {
     Tensor weights;
     Tensor bias;
-} Projection;
+    //arr of pointers
+    Tensor **a_batch;
+    Tensor **z_batch;
+} Layer;
 
 typedef struct {
-    Projection *projections;
+    Layer *layers;
     int n_layers;
 } Layers;
 
 const int image_id = 2051;
 const int label_id = 2049;
+
+typedef Tensor* (*activaton_t)(Tensor* z_i);
 
 int read_header_bytes(FILE *file){
     unsigned char b[4]; 
@@ -177,77 +181,155 @@ void read_data(Data *data, const char *data_path, int batch_size){
     closedir(d);
 }
 
-void initaliseRandomProjections(Layers *layers, int seed){
+void initalise_random_layers(Layers *layers, int seed){
     srand(seed);
     for(int l = 0; l < layers->n_layers; l++){
-        Projection *p = &layers->projections[l];
+        Layer *l_i = &layers->layers[l];
         
         size_t n_elems_weights = 1;
         size_t n_elems_bias = 1;
 
-        int max_rank = (p->weights.rank > p->bias.rank) ? p->weights.rank : p->bias.rank;
+        int max_rank = (l_i->weights.rank > l_i->bias.rank) ? l_i->weights.rank : l_i->bias.rank;
 
         for(int r = 0; r < max_rank; r++){
-            if(r < p->weights.rank){
-                n_elems_weights *= p->weights.shape[r]; 
+            if(r < l_i->weights.rank){
+                n_elems_weights *= l_i->weights.shape[r]; 
             }
 
-            if(r < p->bias.rank){
-                n_elems_bias *= p->bias.shape[r]; 
+            if(r < l_i->bias.rank){
+                n_elems_bias *= l_i->bias.shape[r]; 
             }
 
         }
 
-        p->weights.entries = malloc(n_elems_weights * sizeof(float));
-        p->bias.entries = malloc(n_elems_bias * sizeof(float));
+        l_i->weights.entries = malloc(n_elems_weights * sizeof(float));
+        l_i->bias.entries = malloc(n_elems_bias * sizeof(float));
 
         int max_elems = (n_elems_weights > n_elems_bias) ? n_elems_weights : n_elems_bias;
         for(int i = 0; i < max_elems; i++){
             if(i < n_elems_bias){
-                p->bias.entries[i] = ((float)rand()/(float)(RAND_MAX/2)) - 1.0;   
+                l_i->bias.entries[i] = ((float)rand()/(float)(RAND_MAX/2)) - 1.0;   
             }
 
             if(i < n_elems_weights){
-                p->weights.entries[i] = ((float)rand()/(float)(RAND_MAX/2)) - 1.0;   
+                l_i->weights.entries[i] = ((float)rand()/(float)(RAND_MAX/2)) - 1.0;   
             }
         }
     }
 }
 
 
+Tensor* matmul(Tensor A, Tensor B){
+    //In AB we go down the rows of matrix A and across the columns of B
+    if (A.rank != 2 || B.rank != 1) {
+        printf("A must be rank 2, is %i\n B must be rank, is %i\n", A.rank, B.rank);
+        exit(1);
+    }
 
-float relu(float z_i){
-    return (z_i <= 0.0f) ? 0.0f : z_i;
+    int a_height = A.shape[0]; 
+    int a_width = A.shape[1]; 
+
+    int b_height = B.shape[0]; 
+    if(a_width != b_height){
+        printf("The number of columns of A must match the rows of B, A shape: (%i, %i), B rows: (%i, %i)\n", A.shape[0], A.shape[1], B.shape[0], B.shape[1]);
+        exit(1);
+    }
+
+
+
+    Tensor *C = malloc(sizeof(Tensor));
+    C->shape = malloc(sizeof(int));
+    memcpy(C->shape, &A.shape[0], sizeof(int));
+    
+    C->rank = 1;
+    C->entries = malloc(C->shape[0] * sizeof(float));
+
+    //choose the row of A
+    for(int i = 0; i < a_height; i++){
+        float c_ij = 0;
+        //choose row of B, n cols is 1 so we collapse the extra loop
+        for(int j = 0; j < b_height; j++){
+            float a_ik = A.entries[i * a_width + j];
+            float b_kj = B.entries[j];
+
+            c_ij += a_ik * b_kj;
+        }
+
+        C->entries[i] = c_ij;
+    }
+
+    return C;
 }
 
-Tensor forward_pass(Layers layers, Tensor batch){
+Tensor* relu(Tensor *z_i){
+    if(z_i->rank != 1){
+        printf("Error z must be rank 1, is rank %i\n", z_i->rank);
+        exit(1);
+    }
+
+    int n_elems = z_i->shape[0];
+
+    Tensor *a = malloc(sizeof(Tensor));
+    a->entries = malloc(n_elems * sizeof(float));
+    a->shape = malloc(sizeof(int));
+    memcpy(a->shape, &z_i->shape[0], sizeof(int));
+    a->rank = 1; 
+    for(int i = 0; i < n_elems; i++){
+        a->entries[i] = (z_i->entries[i] > 0) ? z_i->entries[i] : 0;    
+    }
+
+    return a;
+}
+
+//we use cross entropy as our loss
+void backpropogation(Layers *layers, Tensor label_batch, activaton_t activation){
+    int batch_size = label_batch.shape[0];
+    //now i have (32, 10, 1) for the shape of each 
+}
+
+//input is (batch_size, 784, 1)
+void forward_pass(Layers layers, Tensor batch){
     int batch_size = batch.shape[0];
 
-    Tensor input_tensor;
-
-    input_tensor.rank = batch.rank - 1;
-    //we allocate to it first so that its safe to allocate or it could write to a dangerous location
-    input_tensor.shape = malloc(input_tensor.rank * sizeof(int));
-
-    //.shape is an *int so no need for &
-    memcpy(input_tensor.shape, &batch.shape[1], (input_tensor.rank) * sizeof(int));
-
-    int n_elems = 1;
-    for(int i = 0; i < input_tensor.rank; i++){
-        n_elems *= input_tensor.shape[i];
+    int output_dim;
+    {
+        Tensor final_proj_w = layers.layers[layers.n_layers - 1].weights;
+        int final_proj_rank = final_proj_w.rank;
+        output_dim = final_proj_w.shape[final_proj_rank - 1];
     }
 
-    input_tensor.entries = malloc(n_elems * sizeof(float));
+
+    int input_n_elems = 1;
+    for(int i = 1; i < batch.rank - 1; i++){
+        input_n_elems *= batch.shape[i];
+    }
 
     for(int idx = 0; idx < batch_size; idx++){
-        memcpy(input_tensor.entries, &batch.entries[idx * n_elems], n_elems * sizeof(float));
-        
-        for(int layer_i = 0; layer_i < layers.n_layers; layer_i++){
-            
-        }
-    }
+        /*printf("Batch idx %i\n", idx);*/
+        Tensor *input_vector = malloc(sizeof(Tensor));
+        input_vector->shape = malloc(sizeof(int));
 
-    return input_tensor;
+        memcpy(input_vector->shape, &batch.shape[1], sizeof(int));
+
+        input_vector->rank = 1;
+        input_vector->entries = malloc(input_n_elems * sizeof(float));
+
+        memcpy(input_vector->entries, &batch.entries[input_n_elems * idx], input_n_elems * sizeof(float));
+
+        for(int i = 0; i < layers.n_layers; i++){
+            Layer layer_i = layers.layers[i];  
+            Tensor *z = matmul(layer_i.weights, *input_vector);
+
+            layer_i.z_batch[idx] = z;
+
+            //a fresh new activation vector here
+            Tensor *a = relu(z); 
+            layer_i.a_batch[idx] = a;
+
+            input_vector = a;
+        }
+
+    }
 }
 
 //we batch the input data and save the change in weights, for after we have run the whole batch we update with the average change in weights
@@ -256,6 +338,7 @@ Tensor forward_pass(Layers layers, Tensor batch){
 //image data is an array of 3D tensors (n_batches, batch_size, n_rows*n_cols, 1)
 //label data is an array of @D tensors (n_batches, batch_size, 1)
 void train(Layers *layers, Data data, size_t n_epochs){
+
     int n_batches = data.image_batches->shape[0];
     if(n_batches != data.label_batches->shape[0]){
         printf("Number of batches in training and label data do not match\n");
@@ -263,6 +346,7 @@ void train(Layers *layers, Data data, size_t n_epochs){
     }
     for(int epoch_i = 0; epoch_i < n_epochs; epoch_i++){
         for(int batch_i = 0; batch_i < n_batches; batch_i++){
+            /*printf("Fetching batch %i\n", batch_i);*/
             //batch size in each 
             Tensor img_batch = data.image_batches[batch_i];
             Tensor label_batch = data.label_batches[batch_i];
@@ -272,7 +356,13 @@ void train(Layers *layers, Data data, size_t n_epochs){
                 exit(1);
             }
 
+            printf("Propogating forward batch %i, epoch %i\n", batch_i, epoch_i);
             forward_pass(*layers, img_batch);
+
+            printf("Propogating backwards batch %i, epoch %i\n", batch_i, epoch_i);
+            backpropogation(layers, label_batch, relu);
+            //after forward pass we have the prediction
+            /*printf("finished forward pass\n");*/
         } 
     }
 }
@@ -297,10 +387,11 @@ int main(void){
 
     Layers layers = {
        .n_layers=3,
-       .projections = malloc(3*sizeof(Projection))
+       .layers= malloc(3*sizeof(Layer))
     };
 
     int prev_dim = 784; //the dimensions of n_rows * n_cols could easily return this in read_data but cba
+
 
     //the dimension after the next projection so index 0 is the dimension after proj 0
     for(int i = 0; i < layers.n_layers; i++){
@@ -312,7 +403,7 @@ int main(void){
         int* p_b_shape = malloc(sizeof(int));
         memcpy(p_b_shape, (int[]){next_dim}, sizeof(int));
 
-        layers.projections[i] = (Projection){
+        layers.layers[i] = (Layer){
                 .weights=(Tensor){
                     .entries=NULL,
                     .shape=p_w_shape,
@@ -325,11 +416,14 @@ int main(void){
                 },
         };
 
+        layers.layers[i].a_batch = malloc(batch_size * sizeof(Tensor *));
+        layers.layers[i].z_batch = malloc(batch_size * sizeof(Tensor *));
+
         prev_dim = next_dim;
     }
 
     int seed = 42; //rng seed
-    initaliseRandomProjections(&layers, seed);
+    initalise_random_layers(&layers, seed);
 
     train(&layers, training_data, 1);
     //weights are initalised so now i need to forward pass 
