@@ -1,8 +1,11 @@
 #include <stdio.h>
+#include <math.h> // For fabsf()
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+
+#define EPSILON 1e-6
 
 typedef struct {
     float *entries;
@@ -16,8 +19,8 @@ typedef struct {
 } Data;
 
 typedef struct {
-    Tensor weights;
-    Tensor bias;
+    Tensor *weights;
+    Tensor *bias;
     //arr of pointers
     Tensor **a_batch;
     Tensor **z_batch;
@@ -189,30 +192,30 @@ void initalise_random_layers(Layers *layers, int seed){
         size_t n_elems_weights = 1;
         size_t n_elems_bias = 1;
 
-        int max_rank = (l_i->weights.rank > l_i->bias.rank) ? l_i->weights.rank : l_i->bias.rank;
+        int max_rank = (l_i->weights->rank > l_i->bias->rank) ? l_i->weights->rank : l_i->bias->rank;
 
         for(int r = 0; r < max_rank; r++){
-            if(r < l_i->weights.rank){
-                n_elems_weights *= l_i->weights.shape[r]; 
+            if(r < l_i->weights->rank){
+                n_elems_weights *= l_i->weights->shape[r]; 
             }
 
-            if(r < l_i->bias.rank){
-                n_elems_bias *= l_i->bias.shape[r]; 
+            if(r < l_i->bias->rank){
+                n_elems_bias *= l_i->bias->shape[r]; 
             }
 
         }
 
-        l_i->weights.entries = malloc(n_elems_weights * sizeof(float));
-        l_i->bias.entries = malloc(n_elems_bias * sizeof(float));
+        l_i->weights->entries = malloc(n_elems_weights * sizeof(float));
+        l_i->bias->entries = malloc(n_elems_bias * sizeof(float));
 
         int max_elems = (n_elems_weights > n_elems_bias) ? n_elems_weights : n_elems_bias;
         for(int i = 0; i < max_elems; i++){
             if(i < n_elems_bias){
-                l_i->bias.entries[i] = ((float)rand()/(float)(RAND_MAX/2)) - 1.0;   
+                l_i->bias->entries[i] = ((float)rand()/(float)(RAND_MAX/2)) - 1.0;   
             }
 
             if(i < n_elems_weights){
-                l_i->weights.entries[i] = ((float)rand()/(float)(RAND_MAX/2)) - 1.0;   
+                l_i->weights->entries[i] = ((float)rand()/(float)(RAND_MAX/2)) - 1.0;   
             }
         }
     }
@@ -281,10 +284,137 @@ Tensor* relu(Tensor *z_i){
     return a;
 }
 
+float change_in_loss_for_prediction(Tensor *predictions, Tensor batched_true_labels, int row, int output_dim, int batch_size, int batch_idx){
+    float change_in_loss_for_ai = 0.0;
+    for(int k = 0; k < output_dim; k++){
+        float d;
+        if(row == k){
+            d = 1;
+        } else {
+            d = 0;
+        }
+
+        //yk is the true label 
+        int idx = batch_idx * batch_size + k;
+        //true_labels_stores true label, k is the index of the prediction
+        float yk = ((int)(batched_true_labels.entries[idx] == k)) ? 1 : 0;
+        change_in_loss_for_ai +=  yk * (d * predictions->entries[row]);
+    }
+
+    return change_in_loss_for_ai *= -1;
+
+}
+
+//label batch dim (batch_size, 10)
+//cross entropy loss
+float get_change_in_loss_for_weight(Layers *layers, Tensor batched_true_labels, int batch_idx, int depth, int weight_index){
+    float delta = 0.0;
+
+    int batch_size = batched_true_labels.shape[0];
+    int output_dim = batched_true_labels.shape[1];
+    /*printf("label batch dim (%i, %i)\n", batch_size, output_dim);*/
+    /*printf("label rank %i\n", batched_true_labels.rank);*/
+    int n_layers = layers->n_layers;
+    int w_row = weight_index / layers->layers[n_layers - (depth + 1)].weights->shape[0];
+    int w_col = weight_index / layers->layers[n_layers - (depth + 1 )].weights->shape[1];
+
+    Tensor *predictions = layers->layers[n_layers - 1].a_batch[batch_idx];
+    switch (depth){
+        case 0: {
+
+            //divide by the raw index weight by the n rows in the layer weights to get the row index i
+
+
+            float change_in_loss_for_ai = change_in_loss_for_prediction(predictions, batched_true_labels, w_row, output_dim, batch_size, batch_idx);
+
+            float zi_final_layer = (layers->layers[n_layers - 1].z_batch[batch_idx]->entries[w_row]);
+            float change_in_ai_for_zi = (zi_final_layer> 0.0) ? zi_final_layer: 0.0;
+             
+            //same as aj in penultimate layer
+            float change_in_zi_for_weight = (layers->layers[n_layers - 2].a_batch[batch_idx]->entries[w_col]);
+            
+            delta = change_in_loss_for_ai * change_in_ai_for_zi * change_in_zi_for_weight;
+            break;
+        }
+        case 1: {
+            Tensor *predictions = layers->layers[n_layers - 1].a_batch[batch_idx];
+            Tensor *final_z = layers->layers[n_layers - 1].z_batch[batch_idx];
+            
+            float change_in_loss_for_ai = 0.0;
+            int final_layer_weights_width = layers->layers[n_layers - 1].weights->shape[0];
+            //rows of z
+            for(int k = 0; k < final_z->shape[0]; k++){
+                //change in zk for ai is just the layer weight w_ki. index i here is just the row inde of the weight we are minimising the 
+                //loss for
+                float change_in_zk_for_ai = layers->layers[n_layers - 1].weights->entries[k * final_layer_weights_width + w_row];
+
+                float zi_final_layer = (layers->layers[n_layers - 1].z_batch[batch_idx]->entries[w_row]);
+                float change_in_ai_for_zi = (zi_final_layer> 0.0) ? zi_final_layer: 0.0;
+
+                float change_in_loss_for_ai = change_in_loss_for_prediction(predictions, batched_true_labels, w_row, output_dim, batch_size, batch_idx);
+
+                change_in_loss_for_ai += (change_in_loss_for_ai * change_in_ai_for_zi * change_in_zk_for_ai);
+            }
+
+            float zi_penultimate_layer = (layers->layers[n_layers - 2].z_batch[batch_idx]->entries[w_row]);
+            //hold on may be some floating point shenanigans here
+            float change_in_ai_for_zi_penultimate = (zi_penultimate_layer > 0.0) ? zi_penultimate_layer : 0.0; 
+
+            float change_in_zi_for_weight = (layers->layers[n_layers - 2].a_batch[batch_idx]->entries[w_col]);
+            delta += change_in_loss_for_ai * change_in_ai_for_zi_penultimate * change_in_zi_for_weight;
+            break;
+           }
+        case 2:
+            break;
+        default:
+            printf("cannot support depth/layers over 3\n");
+            exit(1);
+    }
+
+    return delta;
+}
+
 //we use cross entropy as our loss
-void backpropogation(Layers *layers, Tensor label_batch, activaton_t activation){
+void backpropogation(Layers *layers, Tensor label_batch, activaton_t activation, float learning_rate){
     int batch_size = label_batch.shape[0];
-    //now i have (32, 10, 1) for the shape of each 
+    int final_vec_dim = label_batch.shape[1];
+    int n_layers = layers->n_layers;
+
+    for(int batch_idx = 0; batch_idx < batch_size; batch_idx++){
+        /*printf("\n\ncomputing batch %i/%i\n\n", batch_idx, batch_size);*/
+        float* updated_weights[n_layers];
+        for(int i = 0; i < n_layers; i++){
+            Layer curr_layer = layers->layers[i];
+            if(curr_layer.weights->rank != 2){
+                printf("Layer %i weights must be rank 2", i);
+                exit(1);
+            }
+
+            int n_entries = curr_layer.weights->shape[0] * curr_layer.weights->shape[1];
+            updated_weights[i]= malloc(n_entries*sizeof(float));
+            memcpy(updated_weights[i], curr_layer.weights->entries, n_entries * sizeof(float));
+        }
+
+        //back to front
+        for(int depth = 0; depth < n_layers; depth++){
+            Layer curr_layer = layers->layers[n_layers - (depth + 1)];
+            int n_entries = curr_layer.weights->shape[0] * curr_layer.weights->shape[1];
+
+            for(int weight_index = 0; weight_index < n_entries; weight_index++){
+                float change_in_loss_for_weight = get_change_in_loss_for_weight(layers, label_batch, batch_idx, depth, weight_index);
+                //same as averaging later
+                updated_weights[n_layers - (depth + 1)][weight_index] += (learning_rate * change_in_loss_for_weight) / batch_size; 
+            }
+        }
+
+        // Free old weights and assign updated weights
+        for (int i = 0; i < n_layers; i++) {
+            int n_entries = layers->layers[i].weights->shape[0] * layers->layers[i].weights->shape[1];
+            memcpy(layers->layers[i].weights->entries, updated_weights[i], n_entries * sizeof(float));
+            free(updated_weights[i]);
+        }
+
+    }
 }
 
 //input is (batch_size, 784, 1)
@@ -293,9 +423,9 @@ void forward_pass(Layers layers, Tensor batch){
 
     int output_dim;
     {
-        Tensor final_proj_w = layers.layers[layers.n_layers - 1].weights;
-        int final_proj_rank = final_proj_w.rank;
-        output_dim = final_proj_w.shape[final_proj_rank - 1];
+        Tensor *final_proj_w = layers.layers[layers.n_layers - 1].weights;
+        int final_proj_rank = final_proj_w->rank;
+        output_dim = final_proj_w->shape[final_proj_rank - 1];
     }
 
 
@@ -305,7 +435,6 @@ void forward_pass(Layers layers, Tensor batch){
     }
 
     for(int idx = 0; idx < batch_size; idx++){
-        /*printf("Batch idx %i\n", idx);*/
         Tensor *input_vector = malloc(sizeof(Tensor));
         input_vector->shape = malloc(sizeof(int));
 
@@ -318,7 +447,7 @@ void forward_pass(Layers layers, Tensor batch){
 
         for(int i = 0; i < layers.n_layers; i++){
             Layer layer_i = layers.layers[i];  
-            Tensor *z = matmul(layer_i.weights, *input_vector);
+            Tensor *z = matmul(*layer_i.weights, *input_vector);
 
             layer_i.z_batch[idx] = z;
 
@@ -336,14 +465,17 @@ void forward_pass(Layers layers, Tensor batch){
 //batch size as a multiple of 32 due to hardware optimisations with the gpu later (warps) -> 64
 
 //image data is an array of 3D tensors (n_batches, batch_size, n_rows*n_cols, 1)
-//label data is an array of @D tensors (n_batches, batch_size, 1)
-void train(Layers *layers, Data data, size_t n_epochs){
+//label data is an array of 3D tensors (n_batches, batch_size, 10)
+void train(Layers *layers, Data data, size_t n_epochs, float learning_rate){
 
     int n_batches = data.image_batches->shape[0];
+    int batch_size = data.image_batches->shape[1];
+
     if(n_batches != data.label_batches->shape[0]){
         printf("Number of batches in training and label data do not match\n");
         exit(1);
     }
+
     for(int epoch_i = 0; epoch_i < n_epochs; epoch_i++){
         for(int batch_i = 0; batch_i < n_batches; batch_i++){
             /*printf("Fetching batch %i\n", batch_i);*/
@@ -360,15 +492,12 @@ void train(Layers *layers, Data data, size_t n_epochs){
             forward_pass(*layers, img_batch);
 
             printf("Propogating backwards batch %i, epoch %i\n", batch_i, epoch_i);
-            backpropogation(layers, label_batch, relu);
+            backpropogation(layers, label_batch, relu, learning_rate);
             //after forward pass we have the prediction
             /*printf("finished forward pass\n");*/
         } 
     }
 }
-
-
-
 
 int main(void){
     Data training_data = {
@@ -403,18 +532,13 @@ int main(void){
         int* p_b_shape = malloc(sizeof(int));
         memcpy(p_b_shape, (int[]){next_dim}, sizeof(int));
 
-        layers.layers[i] = (Layer){
-                .weights=(Tensor){
-                    .entries=NULL,
-                    .shape=p_w_shape,
-                    .rank=2
-                },
-                .bias=(Tensor){
-                    .entries=NULL,
-                    .shape=p_b_shape,
-                    .rank=1
-                },
-        };
+        layers.layers[i].weights = malloc(sizeof(Tensor));
+        layers.layers[i].weights->shape = p_w_shape;
+        layers.layers[i].weights->rank = 2;
+
+        layers.layers[i].bias = malloc(sizeof(Tensor));
+        layers.layers[i].bias->shape = p_b_shape;
+        layers.layers[i].bias->rank = 1;
 
         layers.layers[i].a_batch = malloc(batch_size * sizeof(Tensor *));
         layers.layers[i].z_batch = malloc(batch_size * sizeof(Tensor *));
@@ -425,7 +549,7 @@ int main(void){
     int seed = 42; //rng seed
     initalise_random_layers(&layers, seed);
 
-    train(&layers, training_data, 1);
+    train(&layers, training_data, 1, 0.1);
     //weights are initalised so now i need to forward pass 
     //input data matmul with project then activation till final layer 
     return 0;
