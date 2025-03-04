@@ -16,6 +16,7 @@ typedef struct {
 typedef struct {
     Tensor* image_batches;
     Tensor* label_batches;
+    size_t n_batches;
 } Data;
 
 typedef struct {
@@ -80,6 +81,8 @@ void read_data(Data *data, const char *data_path, int batch_size){
                 int n_rows = read_header_bytes(file);
                 int n_cols = read_header_bytes(file);
                 size_t n_batches = n_images / batch_size;
+                
+                data->n_batches = n_batches;
 
                 //goal tensor (n_batches, batch_size, n_rows, n_cols)
                 if(data->image_batches == NULL){
@@ -95,8 +98,8 @@ void read_data(Data *data, const char *data_path, int batch_size){
 
                 bool alloc = true;
 
-                int *shape_ptr = malloc(3*sizeof(int));
-                memcpy(shape_ptr, (int[]){batch_size, n_rows * n_cols, 1}, 3*sizeof(int));
+                int *shape_ptr = malloc(2*sizeof(int));
+                memcpy(shape_ptr, (int[]){batch_size, n_rows * n_cols}, 2*sizeof(int));
 
                 unsigned char buffer;
                 while(fread(&buffer, sizeof(char), 1, file) == 1){
@@ -109,12 +112,12 @@ void read_data(Data *data, const char *data_path, int batch_size){
                         int n_imgs_in_batch = batch_size;
                         if(n_images - img_id < batch_size){
                             n_imgs_in_batch = n_images - img_id; 
-                            shape_ptr = malloc(3*sizeof(int));
-                            memcpy(shape_ptr, (int[]){n_imgs_in_batch, n_rows * n_cols, 1}, 3*sizeof(int));
+                            shape_ptr = malloc(2*sizeof(int));
+                            memcpy(shape_ptr, (int[]){n_imgs_in_batch, n_rows * n_cols}, 2*sizeof(int));
                         }
 
                         data->image_batches[batch_id].entries = malloc(n_imgs_in_batch * n_rows * n_cols * sizeof(float));
-                        data->image_batches[batch_id].rank = 3;
+                        data->image_batches[batch_id].rank = 2;
                         data->image_batches[batch_id].shape = shape_ptr;
                         alloc = false;
                     } 
@@ -131,6 +134,7 @@ void read_data(Data *data, const char *data_path, int batch_size){
             } else if(magic_number == label_id) {
                 int n_labels = read_header_bytes(file);
                 size_t n_batches = n_labels / batch_size;
+                data->n_batches = n_batches;
                 
                 //goal tensor is (n_batches, batch_size, 1)
                 if(data->label_batches== NULL){
@@ -319,53 +323,114 @@ float get_change_in_loss_for_weight(Layers *layers, Tensor batched_true_labels, 
     int w_col = weight_index / layers->layers[n_layers - (depth + 1 )].weights->shape[1];
 
     Tensor *predictions = layers->layers[n_layers - 1].a_batch[batch_idx];
+    int curr_layer = n_layers - 1;
     switch (depth){
         case 0: {
-
             //divide by the raw index weight by the n rows in the layer weights to get the row index i
-
-
             float change_in_loss_for_ai = change_in_loss_for_prediction(predictions, batched_true_labels, w_row, output_dim, batch_size, batch_idx);
 
-            float zi_final_layer = (layers->layers[n_layers - 1].z_batch[batch_idx]->entries[w_row]);
-            float change_in_ai_for_zi = (zi_final_layer> 0.0) ? zi_final_layer: 0.0;
+            float zi = (layers->layers[curr_layer].z_batch[batch_idx]->entries[w_row]);
+            float change_in_ai_for_zi = (zi > 0.0) ? 1.0 : 0.0;
              
+
+            curr_layer--;
             //same as aj in penultimate layer
-            float change_in_zi_for_weight = (layers->layers[n_layers - 2].a_batch[batch_idx]->entries[w_col]);
+            float change_in_zi_for_weight = (layers->layers[curr_layer].a_batch[batch_idx]->entries[w_col]);
             
             delta = change_in_loss_for_ai * change_in_ai_for_zi * change_in_zi_for_weight;
             break;
         }
         case 1: {
-            Tensor *predictions = layers->layers[n_layers - 1].a_batch[batch_idx];
-            Tensor *final_z = layers->layers[n_layers - 1].z_batch[batch_idx];
+            Tensor *z = layers->layers[curr_layer].z_batch[batch_idx];
             
             float change_in_loss_for_ai = 0.0;
-            int final_layer_weights_width = layers->layers[n_layers - 1].weights->shape[0];
+            int final_layer_weights_width = layers->layers[curr_layer].weights->shape[0];
             //rows of z
-            for(int k = 0; k < final_z->shape[0]; k++){
-                //change in zk for ai is just the layer weight w_ki. index i here is just the row inde of the weight we are minimising the 
+            for(int j = 0; j < z->shape[0]; j++){
+                //change in zj for ai is just the layer weight w_ji. index i here is just the row inde of the weight we are minimising the 
                 //loss for
-                float change_in_zk_for_ai = layers->layers[n_layers - 1].weights->entries[k * final_layer_weights_width + w_row];
+                float change_in_zj_for_ai = layers->layers[curr_layer].weights->entries[j * final_layer_weights_width + w_row];
 
-                float zi_final_layer = (layers->layers[n_layers - 1].z_batch[batch_idx]->entries[w_row]);
-                float change_in_ai_for_zi = (zi_final_layer> 0.0) ? zi_final_layer: 0.0;
+                float zj = (layers->layers[curr_layer].z_batch[batch_idx]->entries[j]);
+                float change_in_aj_for_zj = (zj > 0.0) ? 1.0 : 0.0;
 
-                float change_in_loss_for_ai = change_in_loss_for_prediction(predictions, batched_true_labels, w_row, output_dim, batch_size, batch_idx);
+                float change_in_loss_for_aj = change_in_loss_for_prediction(predictions, batched_true_labels, j, output_dim, batch_size, batch_idx);
 
-                change_in_loss_for_ai += (change_in_loss_for_ai * change_in_ai_for_zi * change_in_zk_for_ai);
+                change_in_loss_for_ai += (change_in_zj_for_ai * change_in_aj_for_zj * change_in_loss_for_aj);
             }
 
-            float zi_penultimate_layer = (layers->layers[n_layers - 2].z_batch[batch_idx]->entries[w_row]);
+            curr_layer--;
+            float zi = (layers->layers[curr_layer].z_batch[batch_idx]->entries[w_row]);
             //hold on may be some floating point shenanigans here
-            float change_in_ai_for_zi_penultimate = (zi_penultimate_layer > 0.0) ? zi_penultimate_layer : 0.0; 
+            float change_in_ai_for_zi = (zi > 0.0) ? 1.0 : 0.0; 
 
-            float change_in_zi_for_weight = (layers->layers[n_layers - 2].a_batch[batch_idx]->entries[w_col]);
-            delta += change_in_loss_for_ai * change_in_ai_for_zi_penultimate * change_in_zi_for_weight;
+            float change_in_zi_for_weight = (layers->layers[curr_layer].a_batch[batch_idx]->entries[w_col]);
+            delta += change_in_zi_for_weight * change_in_ai_for_zi *  change_in_loss_for_ai;
             break;
            }
-        case 2:
+        case 2: {
+            float change_in_loss_for_a = 0.0;
+
+            for(int j = 0; j < predictions->shape[0]; j++){
+                change_in_loss_for_a += change_in_loss_for_prediction(predictions, batched_true_labels, j, output_dim, batch_size, batch_idx);
+            }
+
+            {
+                Tensor *z = layers->layers[curr_layer].z_batch[batch_idx];
+                Tensor *a = layers->layers[curr_layer - 1].a_batch[batch_idx];
+
+                float change_in_a_for_z_times_change_in_a_for_z = 0.0;
+                for(int i = 0; i < z->shape[0]; i++){
+                    for(int j = 0; j < a->shape[0]; j++){
+                        float zi = layers->layers[curr_layer].z_batch[batch_idx]->entries[i];
+                        Tensor *layer_weights = layers->layers[curr_layer].weights;
+                        int layer_width = layer_weights->shape[0];
+
+                        float change_in_ai_for_zi = ( zi > 0.0 ? 1.0 : 0.0);
+                        //just weight wij for this layer
+                        float change_in_zi_for_aj = layer_weights->entries[layer_width * i + j];
+
+                        change_in_a_for_z_times_change_in_a_for_z += change_in_zi_for_aj * change_in_ai_for_zi;
+                    }
+                }
+                delta = change_in_a_for_z_times_change_in_a_for_z;
+            }
+
+            curr_layer--;
+            {
+                float change_in_z_for_ai_times_change_in_a_for_z = 0.0;
+                Tensor *z = layers->layers[curr_layer].z_batch[batch_idx];
+                Tensor *a = layers->layers[curr_layer - 1].a_batch[batch_idx];
+
+                for(int j = 0; j < z->shape[0]; j++){
+                    float zj = layers->layers[curr_layer].z_batch[batch_idx]->entries[j];
+                    Tensor *layer_weights = layers->layers[curr_layer].weights;
+                    int layer_width = layer_weights->shape[0];
+
+
+                    float change_in_aj_for_zj = zj > 0.0 ? 1.0 : 0.0;
+                    float change_in_zj_for_ai = layer_weights->entries[layer_width * w_row + j];
+                    change_in_z_for_ai_times_change_in_a_for_z += change_in_zj_for_ai * change_in_aj_for_zj;
+                }
+
+                delta += change_in_z_for_ai_times_change_in_a_for_z;
+            }
+
+            curr_layer--;
+            
+            {
+                float zi = layers->layers[curr_layer].z_batch[batch_idx]->entries[w_row];
+                float aj = layers->layers[curr_layer].a_batch[batch_idx]->entries[w_row];
+
+                float change_in_ai_for_zi = (zi > 0.0 ? 1.0 : 0.0);
+                delta *= change_in_ai_for_zi;
+
+                float change_in_zi_for_weight = aj;
+                delta *= change_in_ai_for_zi;
+
+            }
             break;
+        }
         default:
             printf("cannot support depth/layers over 3\n");
             exit(1);
@@ -461,6 +526,21 @@ void forward_pass(Layers layers, Tensor batch){
     }
 }
 
+Tensor* predict(Layers layers, Tensor *input){
+    for(int i = 0; i < layers.n_layers; i++){
+        Layer layer_i = layers.layers[i];  
+        Tensor *z = matmul(*layer_i.weights, *input);
+        free(input);
+
+        //a fresh new activation vector here
+        Tensor *a = relu(z); 
+        input = a;
+        free(z);
+    }
+
+    return input;
+}
+
 //we batch the input data and save the change in weights, for after we have run the whole batch we update with the average change in weights
 //batch size as a multiple of 32 due to hardware optimisations with the gpu later (warps) -> 64
 
@@ -468,13 +548,8 @@ void forward_pass(Layers layers, Tensor batch){
 //label data is an array of 3D tensors (n_batches, batch_size, 10)
 void train(Layers *layers, Data data, size_t n_epochs, float learning_rate){
 
-    int n_batches = data.image_batches->shape[0];
-    int batch_size = data.image_batches->shape[1];
-
-    if(n_batches != data.label_batches->shape[0]){
-        printf("Number of batches in training and label data do not match\n");
-        exit(1);
-    }
+    int n_batches = data.n_batches;
+    printf("n batches: %i\n", n_batches);
 
     for(int epoch_i = 0; epoch_i < n_epochs; epoch_i++){
         for(int batch_i = 0; batch_i < n_batches; batch_i++){
@@ -483,6 +558,7 @@ void train(Layers *layers, Data data, size_t n_epochs, float learning_rate){
             Tensor img_batch = data.image_batches[batch_i];
             Tensor label_batch = data.label_batches[batch_i];
 
+            size_t batch_size = img_batch.shape[0];
             if(img_batch.shape[0] != label_batch.shape[0]){
                 printf("batch size of in training and label data do not match\n");
                 exit(1);
@@ -493,11 +569,76 @@ void train(Layers *layers, Data data, size_t n_epochs, float learning_rate){
 
             printf("Propogating backwards batch %i, epoch %i\n", batch_i, epoch_i);
             backpropogation(layers, label_batch, relu, learning_rate);
-            //after forward pass we have the prediction
-            /*printf("finished forward pass\n");*/
-        } 
+
+            for(int k = 0; k < layers->n_layers; k++){
+                /*printf("Layer %i\n", k);*/
+                Layer *curr_layer = &layers->layers[k];
+
+
+                //a_batch is an array of pointers
+                for(size_t ptr_idx = 0; ptr_idx < batch_size; ptr_idx++){
+                    /*printf("print saved projection %li / %li\n", ptr_idx, batch_size);*/
+                    free(curr_layer->a_batch[ptr_idx]);
+                    free(curr_layer->z_batch[ptr_idx]);
+                }
+            }
+        }
+
+        int correct_classifications = 0;
+        int wrong_classifications = 0;
+        //get test accuarcy
+        for(int batch_i = 0; batch_i < n_batches; batch_i++){
+            Tensor img_batch = data.image_batches[batch_i];
+            Tensor label_batch = data.label_batches[batch_i];
+
+            size_t batch_size = img_batch.shape[0];
+            int input_n_elems = 1;
+            for(int i = 1; i < img_batch.rank - 1; i++){
+                input_n_elems *= img_batch.shape[i];
+            }       
+
+            for(size_t idx = 0; idx < batch_size; idx++){
+                Tensor *input_vector = malloc(sizeof(Tensor));
+                input_vector->shape = malloc(sizeof(int));
+
+                memcpy(input_vector->shape, &img_batch.shape[1], sizeof(int));
+
+                input_vector->rank = 1;
+                input_vector->entries = malloc(input_n_elems * sizeof(float));
+
+                memcpy(input_vector->entries, &img_batch.entries[input_n_elems * idx], input_n_elems * sizeof(float));
+
+                Tensor *predictions = predict(*layers, input_vector);
+
+                float argmax = -1;
+                int classification = -1;
+                for(int k = 0; predictions->shape[0]; k++){
+                    float arg = predictions->entries[k];
+                    if(arg > argmax){
+                        argmax = arg;
+                        classification = k;
+                    } 
+                }
+
+                int true_classification = label_batch.entries[batch_i * batch_size + idx];
+                if(classification == true_classification){
+                    correct_classifications += 1;
+                } else {
+                    wrong_classifications += 1;
+                }
+
+            }
+
+        }
+
+        float test_set_accuracy = (float)correct_classifications / ((float)wrong_classifications + (float)correct_classifications);
+        printf("Test set accuracy, %f\n", test_set_accuracy);
+
     }
+
 }
+
+
 
 int main(void){
     Data training_data = {
@@ -505,7 +646,7 @@ int main(void){
         .label_batches=NULL,
     };
 
-    int batch_size = 32;
+    int batch_size = 8;
     read_data(&training_data, "data/training/", batch_size);
 
     /*batch_id: 40, entry_id: 22530, img_id: 1308, entry: 0.992157*/
@@ -549,7 +690,7 @@ int main(void){
     int seed = 42; //rng seed
     initalise_random_layers(&layers, seed);
 
-    train(&layers, training_data, 1, 0.1);
+    train(&layers, training_data, 10, 0.1);
     //weights are initalised so now i need to forward pass 
     //input data matmul with project then activation till final layer 
     return 0;
